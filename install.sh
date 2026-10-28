@@ -68,6 +68,7 @@ PHASES=(
     "$BASE_DIR/installers/02-deploy-routing.sh"
     "$BASE_DIR/installers/03-deploy-sidecars.sh"
     "$BASE_DIR/installers/04-deploy-monitor.sh"
+    "$BASE_DIR/installers/05-deploy-trojan.sh"
 )
 
 for phase in "${PHASES[@]}"; do
