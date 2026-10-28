@@ -1,0 +1,797 @@
+#!/usr/bin/env python3
+
+import getpass
+import ipaddress
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+BASE = Path(os.environ.get("TROJAN_BASE_DIR", "/opt/nginxbandits"))
+XRAY_CONFIG = Path(os.environ.get(
+    "TROJAN_XRAY_CONFIG",
+    "/usr/local/etc/xray/nginxbandits-trojan.json"
+))
+NGINX_DIR = Path(os.environ.get(
+    "TROJAN_NGINX_DIR",
+    "/etc/nginx/conf.d"
+))
+STATE_FILE = BASE / "core" / "trojan-servers.json"
+BACKUP_DIR = BASE / "backups" / "trojan-manager"
+SERVICE = os.environ.get(
+    "TROJAN_SYSTEMD_SERVICE",
+    "nginxbandits-trojan.service"
+)
+
+DOMAIN_RE = re.compile(
+    r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+    r"[a-z]{2,63}\Z",
+    re.IGNORECASE
+)
+PATH_RE = re.compile(r"/[A-Za-z0-9/_-]*\Z")
+
+
+class ManagerError(Exception):
+    pass
+
+
+def run(command, *, capture=False, check=True):
+    try:
+        result = subprocess.run(
+            command,
+            text=True,
+            stdout=subprocess.PIPE if capture else None,
+            stderr=subprocess.PIPE if capture else None,
+            check=False
+        )
+    except FileNotFoundError:
+        raise ManagerError(f"Required command not found: {command[0]}")
+
+    if check and result.returncode != 0:
+        detail = ""
+        if capture:
+            detail = (result.stderr or result.stdout or "").strip()
+        raise ManagerError(
+            f"Command failed: {' '.join(map(str, command))}"
+            + (f"\n{detail}" if detail else "")
+        )
+    return result
+
+
+def require_root():
+    if os.geteuid() != 0:
+        raise ManagerError(
+            "Run this operation as root. The menu should invoke the "
+            "manager with sufficient privileges."
+        )
+
+
+def load_json(path):
+    try:
+        return json.loads(path.read_text())
+    except FileNotFoundError:
+        raise ManagerError(f"Configuration not found: {path}")
+    except json.JSONDecodeError as exc:
+        raise ManagerError(f"Invalid JSON in {path}: {exc}")
+
+
+def save_json_atomic(path, data, mode=0o600):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(path.name + f".tmp-{os.getpid()}")
+
+    try:
+        temp.write_text(json.dumps(data, indent=2) + "\n")
+        os.chmod(temp, mode)
+
+        # Xray normally reads its configuration as root:xray.
+        if path == XRAY_CONFIG:
+            try:
+                import grp
+                group_id = grp.getgrnam("xray").gr_gid
+                os.chown(temp, 0, group_id)
+            except KeyError:
+                # Do not invent an owner/group if this installation
+                # uses a different service account.
+                if path.exists():
+                    old = path.stat()
+                    os.chown(temp, old.st_uid, old.st_gid)
+                else:
+                    raise ManagerError(
+                        "Cannot determine Xray configuration group. "
+                        "Refusing to install a potentially unreadable config."
+                    )
+        elif path.exists():
+            old = path.stat()
+            os.chown(temp, old.st_uid, old.st_gid)
+
+        os.chmod(temp, mode)
+        os.replace(temp, path)
+    finally:
+        if temp.exists():
+            temp.unlink()
+
+
+
+def snapshot(paths):
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(BACKUP_DIR, 0o700)
+
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    folder = BACKUP_DIR / f"{stamp}-{os.getpid()}"
+    folder.mkdir(mode=0o700)
+
+    manifest = []
+    for index, original in enumerate(paths):
+        path = Path(original)
+        exists = path.exists()
+        record = {
+            "path": str(path),
+            "existed": exists,
+            "backup": None,
+            "uid": None,
+            "gid": None,
+            "mode": None
+        }
+
+        if exists:
+            info = path.stat()
+            backup = folder / f"{index}-{path.name}"
+            shutil.copy2(path, backup)
+            os.chmod(backup, 0o600)
+
+            record.update({
+                "backup": str(backup),
+                "uid": info.st_uid,
+                "gid": info.st_gid,
+                "mode": info.st_mode & 0o7777
+            })
+
+        manifest.append(record)
+
+    manifest_path = folder / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+    os.chmod(manifest_path, 0o600)
+    return manifest
+
+
+
+def restore_snapshot(manifest):
+    for item in manifest:
+        path = Path(item["path"])
+
+        if item["existed"]:
+            backup = Path(item["backup"])
+            if not backup.is_file():
+                raise ManagerError(
+                    f"Rollback backup is missing: {backup}"
+                )
+
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temp = path.with_name(
+                path.name + f".restore-{os.getpid()}"
+            )
+
+            try:
+                shutil.copy2(backup, temp)
+
+                if item.get("uid") is not None:
+                    os.chown(temp, item["uid"], item["gid"])
+
+                if item.get("mode") is not None:
+                    os.chmod(temp, item["mode"])
+
+                os.replace(temp, path)
+            finally:
+                if temp.exists():
+                    temp.unlink()
+
+        elif path.exists():
+            path.unlink()
+
+
+
+def xray_binary():
+    found = shutil.which("xray")
+    if found:
+        return found
+
+    for candidate in (
+        "/usr/local/bin/xray",
+        "/usr/bin/xray",
+        "/usr/local/sbin/xray"
+    ):
+        if Path(candidate).is_file() and os.access(candidate, os.X_OK):
+            return candidate
+
+    raise ManagerError("Cannot find the Xray executable.")
+
+
+def validate_xray(config_path):
+    run([
+        xray_binary(), "run", "-test",
+        "-config", str(config_path)
+    ], capture=True)
+
+
+
+def validate_nginx(candidate_path=None, candidate_text=None):
+    """
+    Validate an Nginx candidate in an isolated temporary configuration.
+    No live Nginx configuration file is changed by this function.
+    With no candidate_path, validate the active configuration as usual.
+    """
+    if candidate_path is None:
+        run(["nginx", "-t"], capture=True)
+        return
+
+    import tempfile
+
+    candidate_path = Path(candidate_path)
+    live_conf_dir = candidate_path.parent
+    main_config = Path("/etc/nginx/nginx.conf")
+
+    if not main_config.is_file():
+        raise ManagerError(f"Nginx main configuration not found: {main_config}")
+
+    with tempfile.TemporaryDirectory(prefix="nginxbandits-check-") as tmp:
+        tmp_root = Path(tmp)
+        isolated_conf_dir = tmp_root / "conf.d"
+        isolated_conf_dir.mkdir()
+
+        # Preserve all existing vhosts except the one being added/replaced
+        # or removed. The candidate is added only to the temporary directory.
+        for existing in live_conf_dir.glob("*.conf"):
+            if existing.name == candidate_path.name:
+                continue
+            if existing.is_file():
+                (isolated_conf_dir / existing.name).symlink_to(existing)
+
+        if candidate_text is not None:
+            candidate_file = isolated_conf_dir / candidate_path.name
+            candidate_file.write_text(candidate_text)
+            candidate_file.chmod(0o644)
+
+        config_text = main_config.read_text()
+        include_pattern = (
+            r"(?m)^[ \t]*include[ \t]+"
+            r"/etc/nginx/conf\.d/\*\.conf[ \t]*;"
+        )
+        replacement = f"include {isolated_conf_dir}/*.conf;"
+        config_text, count = re.subn(
+            include_pattern, replacement, config_text
+        )
+
+        if count != 1:
+            raise ManagerError(
+                "Could not safely isolate Nginx configuration: "
+                "expected exactly one conf.d include in nginx.conf."
+            )
+
+        isolated_main = tmp_root / "nginx.conf"
+        isolated_main.write_text(config_text)
+
+        # nginx -t checks syntax without restarting or reloading Nginx.
+        run(
+            ["nginx", "-t", "-c", str(isolated_main), "-p", "/"],
+            capture=True,
+        )
+
+
+
+def service_action(action):
+    run(["systemctl", action, SERVICE], capture=True)
+
+
+def load_state():
+    if not STATE_FILE.exists():
+        return {"servers": []}
+
+    data = load_json(STATE_FILE)
+    if not isinstance(data, dict) or not isinstance(
+        data.get("servers"), list
+    ):
+        raise ManagerError(f"Invalid manager state: {STATE_FILE}")
+    return data
+
+
+def validate_domain(domain):
+    domain = domain.strip().rstrip(".").lower()
+    if not DOMAIN_RE.fullmatch(domain):
+        raise ManagerError(
+            "Enter a valid DNS hostname, such as vpn.example.com."
+        )
+    return domain
+
+
+def validate_tls(domain, cert_path, key_path):
+    cert_path = Path(cert_path).expanduser()
+    key_path = Path(key_path).expanduser()
+
+    if not cert_path.is_file() or not key_path.is_file():
+        raise ManagerError("The certificate or private-key file does not exist.")
+
+    run([
+        "openssl", "x509", "-in", str(cert_path),
+        "-noout", "-checkhost", domain
+    ], capture=True)
+
+    cert_pub = run([
+        "openssl", "x509", "-in", str(cert_path),
+        "-pubkey", "-noout"
+    ], capture=True).stdout
+
+    key_pub = run([
+        "openssl", "pkey", "-in", str(key_path),
+        "-pubout"
+    ], capture=True).stdout
+
+    if cert_pub.strip() != key_pub.strip():
+        raise ManagerError(
+            "The TLS certificate and private key do not match."
+        )
+
+    return str(cert_path), str(key_path)
+
+
+def nginx_files():
+    if not NGINX_DIR.is_dir():
+        raise ManagerError(f"Nginx directory not found: {NGINX_DIR}")
+    return list(NGINX_DIR.glob("*.conf"))
+
+
+def find_domain_conflicts(domain):
+    conflicts = []
+    pattern = re.compile(
+        r"(?im)^\s*server_name\s+([^;]+);"
+    )
+    for file in nginx_files():
+        try:
+            content = file.read_text(errors="replace")
+        except OSError:
+            continue
+        for match in pattern.finditer(content):
+            names = match.group(1).split()
+            if domain in names:
+                conflicts.append(str(file))
+    return conflicts
+
+
+def available_port(config):
+    used = set()
+    for inbound in config.get("inbounds", []):
+        try:
+            used.add(int(inbound.get("port")))
+        except (TypeError, ValueError):
+            pass
+
+    for port in range(10004, 20000):
+        if port in used:
+            continue
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sock.bind(("127.0.0.1", port))
+                return port
+            except OSError:
+                continue
+
+    raise ManagerError("No free backend port found in range 10004–19999.")
+
+
+def make_nginx_config(domain, path, port, cert, key):
+    return f"""server {{
+    listen 80;
+    server_name {domain};
+
+    location ^~ /.well-known/acme-challenge/ {{
+        root /var/www/html;
+        try_files $uri =404;
+    }}
+
+    location = {path} {{
+        proxy_pass http://127.0.0.1:{port};
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }}
+
+    location / {{
+        return 404;
+    }}
+}}
+
+server {{
+    listen 443 ssl;
+    server_name {domain};
+
+    ssl_certificate {cert};
+    ssl_certificate_key {key};
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    location = {path} {{
+        proxy_pass http://127.0.0.1:{port};
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }}
+
+    location / {{
+        return 404;
+    }}
+}}
+"""
+
+
+def managed_conf_name(domain):
+    safe = re.sub(r"[^a-z0-9.-]", "_", domain.lower())
+    return NGINX_DIR / f"nginxbandits-trojan-managed-{safe}.conf"
+
+
+def validate_xray_candidate(config):
+    """Validate candidate Xray JSON before writing to the live config."""
+    import tempfile
+
+    config_path = Path(XRAY_CONFIG)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+
+    fd, temp_name = tempfile.mkstemp(
+        prefix="xray-candidate-",
+        suffix=".json",
+        dir=str(config_path.parent),
+    )
+    os.close(fd)
+    temp_path = Path(temp_name)
+
+    try:
+        temp_path.write_text(json.dumps(config, indent=2) + "\n")
+        os.chmod(temp_path, 0o600)
+        validate_xray(temp_path)
+    finally:
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+
+def apply_changes(config, state, nginx_path, new_state):
+    nginx_path = Path(nginx_path)
+
+    # Validate both proposed configurations before touching live files.
+    validate_xray_candidate(config)
+    candidate_text = None if new_state is None else new_state["nginx_text"]
+    validate_nginx(nginx_path, candidate_text)
+
+    # Capture the existing files before touching any configuration.
+    manifest = snapshot([XRAY_CONFIG, nginx_path, STATE_FILE])
+    xray_restart_attempted = False
+    nginx_reload_attempted = False
+
+    try:
+        save_json_atomic(XRAY_CONFIG, config, 0o640)
+
+        if new_state is None:
+            if nginx_path.exists():
+                nginx_path.unlink()
+        else:
+            nginx_path.parent.mkdir(parents=True, exist_ok=True)
+            temp = nginx_path.with_name(
+                nginx_path.name + f".tmp-{os.getpid()}"
+            )
+
+            try:
+                temp.write_text(new_state["nginx_text"])
+                os.chmod(temp, 0o644)
+                os.replace(temp, nginx_path)
+            finally:
+                if temp.exists():
+                    temp.unlink()
+
+        save_json_atomic(STATE_FILE, state, 0o600)
+
+        # Validate both configurations before applying either service change.
+        validate_xray(XRAY_CONFIG)
+        validate_nginx()
+
+        # From this point, rollback must account for possible service changes.
+        xray_restart_attempted = True
+        service_action("restart")
+        service_action("is-active")
+
+        nginx_reload_attempted = True
+        run(["nginx", "-s", "reload"], capture=True)
+
+    except Exception as original_error:
+        print(
+            "Configuration operation failed; restoring saved files.",
+            file=sys.stderr
+        )
+
+        try:
+            restore_snapshot(manifest)
+
+            # Validate the restored files before attempting recovery.
+            validate_xray(XRAY_CONFIG)
+            validate_nginx()
+
+            # Only recover services whose changes were attempted.
+            if xray_restart_attempted:
+                service_action("restart")
+                service_action("is-active")
+
+            if nginx_reload_attempted:
+                run(["nginx", "-s", "reload"], capture=True)
+
+        except Exception as rollback_error:
+            raise ManagerError(
+                f"Operation failed: {original_error}\n"
+                f"ROLLBACK ALSO NEEDS ATTENTION: {rollback_error}\n"
+                f"Saved files are under: {BACKUP_DIR}"
+            ) from original_error
+
+        raise ManagerError(
+            f"Operation failed; configuration files were restored: "
+            f"{original_error}"
+        ) from original_error
+
+
+
+def add_server():
+    require_root()
+
+    if not XRAY_CONFIG.is_file():
+        raise ManagerError(f"Xray config not found: {XRAY_CONFIG}")
+
+    domain = validate_domain(input("Domain (e.g. vpn.example.com): "))
+    state = load_state()
+
+    if any(s.get("domain") == domain for s in state["servers"]):
+        raise ManagerError("That domain is already managed by this tool.")
+
+    conflicts = find_domain_conflicts(domain)
+    if conflicts:
+        raise ManagerError(
+            "Nginx already has this domain configured in: "
+            + ", ".join(conflicts)
+        )
+
+    cert_default = "/opt/nginxbandits/core/keys/fullchain.cer"
+    key_default = "/opt/nginxbandits/core/keys/private.key"
+    cert_input = input(f"TLS certificate [{cert_default}]: ").strip()
+    key_input = input(f"TLS private key [{key_default}]: ").strip()
+    cert, key = validate_tls(
+        domain,
+        cert_input or cert_default,
+        key_input or key_default
+    )
+
+    path = input("WebSocket path [/trojan-ws]: ").strip() or "/trojan-ws"
+    if not PATH_RE.fullmatch(path) or path == "/":
+        raise ManagerError(
+            "Use a simple path such as /trojan-ws or /client-one."
+        )
+
+    config = load_json(XRAY_CONFIG)
+    if not isinstance(config.get("inbounds"), list):
+        raise ManagerError("Xray config has no valid inbounds list.")
+
+    for inbound in config["inbounds"]:
+        ws = inbound.get("streamSettings", {}).get("wsSettings", {})
+        if ws.get("path") == path:
+            print(
+                "Note: this WebSocket path is already used by an inbound. "
+                "The new server will use a different backend port."
+            )
+
+    port = available_port(config)
+    password = getpass.getpass(
+        "Trojan password (leave blank to generate securely): "
+    ).strip()
+    if not password:
+        import secrets
+        password = secrets.token_urlsafe(32)
+
+    if len(password) < 12:
+        raise ManagerError("Use a password of at least 12 characters.")
+
+    slug = managed_conf_name(domain)
+    if slug.exists():
+        raise ManagerError(f"Managed Nginx file already exists: {slug}")
+
+    inbound = {
+        "listen": "127.0.0.1",
+        "port": port,
+        "protocol": "trojan",
+        "settings": {
+            "clients": [{"password": password}]
+        },
+        "streamSettings": {
+            "network": "ws",
+            "security": "none",
+            "wsSettings": {"path": path}
+        }
+    }
+
+    config["inbounds"].append(inbound)
+    nginx_text = make_nginx_config(domain, path, port, cert, key)
+
+    record = {
+        "domain": domain,
+        "port": port,
+        "path": path,
+        "certificate": cert,
+        "nginx_file": str(slug),
+        "created_at": datetime.now().isoformat(timespec="seconds")
+    }
+    state["servers"].append(record)
+
+    print("\nValidating the proposed configuration...")
+    try:
+        # Validate a temporary Xray copy before touching the live config.
+        temp_config = XRAY_CONFIG.with_name(
+            XRAY_CONFIG.name + f".check-{os.getpid()}"
+        )
+        try:
+            temp_config.write_text(json.dumps(config, indent=2) + "\n")
+            os.chmod(temp_config, 0o600)
+            validate_xray(temp_config)
+        finally:
+            if temp_config.exists():
+                temp_config.unlink()
+
+        # Check the Nginx syntax using a temporary config file only after
+        # the actual file is installed by apply_changes; rollback is enabled.
+        apply_changes(config, state, slug, {"nginx_text": nginx_text})
+
+    except Exception as exc:
+        raise ManagerError(f"Add failed; changes were rolled back where possible: {exc}")
+
+    print("\nTrojan server added successfully.")
+    print(f"Domain:        {domain}")
+    print(f"Backend:       127.0.0.1:{port}")
+    print(f"WebSocket:     {path}")
+    print(f"TLS cert:      {cert}")
+    print(f"Password:      {password}")
+    print("\nSave this password securely; it will not be displayed by list/status.")
+
+
+def list_servers():
+    state = load_state()
+    if not state["servers"]:
+        print("No additional servers have been registered with this manager.")
+        print("The pre-existing Trojan server is not listed because it was")
+        print("created outside this manager.")
+        return
+
+    print(f"{'DOMAIN':38} {'BACKEND':9} WEBSOCKET")
+    print("-" * 75)
+    for server in state["servers"]:
+        print(
+            f"{server['domain'][:37]:38} "
+            f"{str(server['port']):9} {server['path']}"
+        )
+
+
+def show_status():
+    result = run(
+        ["systemctl", "is-active", SERVICE],
+        capture=True,
+        check=False
+    )
+    print(f"Trojan service: {(result.stdout or 'unknown').strip()}")
+    print(f"Xray config:    {XRAY_CONFIG}")
+    print(f"Nginx folder:   {NGINX_DIR}")
+    print(f"Managed state:  {STATE_FILE}")
+
+    try:
+        config = load_json(XRAY_CONFIG)
+        print(f"Xray inbounds:  {len(config.get('inbounds', []))}")
+    except ManagerError as exc:
+        print(f"Xray config:    ERROR — {exc}")
+
+    list_servers()
+
+
+def remove_server():
+    require_root()
+    state = load_state()
+
+    if not state["servers"]:
+        print("There are no manager-managed servers to remove.")
+        return
+
+    list_servers()
+    domain = validate_domain(input("\nExact domain to remove: "))
+
+    selected = next(
+        (s for s in state["servers"] if s.get("domain") == domain),
+        None
+    )
+    if not selected:
+        raise ManagerError(
+            "That domain is not registered with this manager. "
+            "No configuration was changed."
+        )
+
+    if input(f"Type REMOVE {domain} to confirm: ").strip() != f"REMOVE {domain}":
+        print("Cancelled. No changes made.")
+        return
+
+    config = load_json(XRAY_CONFIG)
+    port = int(selected["port"])
+    path = selected["path"]
+
+    before = len(config.get("inbounds", []))
+    config["inbounds"] = [
+        inbound for inbound in config.get("inbounds", [])
+        if not (
+            inbound.get("protocol") == "trojan"
+            and int(inbound.get("port", -1)) == port
+            and inbound.get("streamSettings", {})
+                .get("wsSettings", {}).get("path") == path
+        )
+    ]
+
+    if len(config["inbounds"]) == before:
+        raise ManagerError(
+            "The expected Xray inbound was not found. "
+            "Refusing to remove anything."
+        )
+
+    nginx_path = Path(selected["nginx_file"])
+    if nginx_path.parent != NGINX_DIR or not nginx_path.name.endswith(".conf"):
+        raise ManagerError("Refusing to remove an unexpected Nginx file path.")
+
+    state["servers"] = [
+        server for server in state["servers"]
+        if server.get("domain") != domain
+    ]
+
+    try:
+        apply_changes(config, state, nginx_path, None)
+    except Exception as exc:
+        raise ManagerError(f"Removal failed; rollback attempted: {exc}")
+
+    print(f"Removed managed Trojan server: {domain}")
+
+
+def main():
+    actions = {
+        "add": add_server,
+        "list": list_servers,
+        "status": show_status,
+        "remove": remove_server
+    }
+
+    if len(sys.argv) != 2 or sys.argv[1] not in actions:
+        print("Usage: trojan-manager {add|list|status|remove}")
+        return 2
+
+    try:
+        actions[sys.argv[1]]()
+        return 0
+    except (ManagerError, OSError, ValueError, KeyError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("\nCancelled.")
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

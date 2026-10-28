@@ -1,0 +1,24 @@
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.db
+*.sqlite
+*.sqlite3
+__pycache__/
+*.pyc
+logs/
+
+# Local backups and generated configuration
+*.backup*
+*.bak
+*.old
+core/trojan-servers.json
+
+# Development-only backup copies
+bin/*.pre-*
+installers/*.working-backup
+install.sh.backup-*
