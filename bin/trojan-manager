@@ -172,7 +172,7 @@ def load_config():
     inbound = direct_inbound(config)
     if inbound is None:
         raise ManagerError(
-            f"{path} does not contain a native Trojan+TLS inbound on port 8443. "
+            f"{path} does not contain a native Trojan+TLS inbound on configured port {configured_port()}. "
             "Refusing to overwrite a different server configuration."
         )
     return path, config
