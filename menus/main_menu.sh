@@ -981,7 +981,7 @@ menu_trojan_server() {
         echo
         echo "  [1] Create Trojan account"
         echo "  [2] List Trojan accounts"
-        echo "  [3] Check direct TLS/443 status"
+        echo "  [3] Check Trojan TLS status (configured port)"
         echo "  [4] Remove Trojan account"
         echo "  [0] Return to main menu"
         echo
