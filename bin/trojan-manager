@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Manage user credentials for the direct Trojan TCP/TLS listener on port 443.
+"""Manage user credentials for the direct Trojan TCP/TLS listener on port 8443.
 
 This manager intentionally does not create Nginx virtual hosts or WebSocket
-backends: the project architecture is native Trojan+TLS on TCP/443.
+backends: the project architecture is native Trojan+TLS on TCP/8443.
 """
 import getpass
 import json
@@ -61,6 +61,17 @@ def read_domain():
     raise ManagerError("Set TROJAN_DOMAIN or PRIMARY_DOMAIN in nginxbandits.conf.")
 
 
+def configured_port():
+    config = BASE / "core" / "nginxbandits.conf"
+    if config.is_file():
+        match = re.search(r'^\\s*TROJAN_PORT\\s*=\\s*["\\']?(\\d+)', config.read_text(errors="replace"), re.M)
+        if match:
+            port = int(match.group(1))
+            if 1024 <= port <= 65535:
+                return port
+    return 8443
+
+
 def config_from_service():
     p = run(["systemctl", "cat", SERVICE], check=False)
     text = (p.stdout or "") + "\n" + (p.stderr or "")
@@ -82,7 +93,7 @@ def locate_config():
         if p.is_file():
             try:
                 data = json.loads(p.read_text())
-                if any(x.get("protocol") == "trojan" and int(x.get("port", 0)) == 443
+                if any(x.get("protocol") == "trojan" and int(x.get("port", 0)) == configured_port()
                        for x in data.get("inbounds", [])):
                     return p
             except (OSError, ValueError, TypeError):
@@ -132,7 +143,7 @@ def bootstrap_config(path):
     config = {
         "log": {"loglevel": "warning"},
         "inbounds": [{
-            "listen": "0.0.0.0", "port": 443, "protocol": "trojan",
+            "listen": "0.0.0.0", "port": configured_port(), "protocol": "trojan",
             "settings": {"clients": [], "fallbacks": []},
             "streamSettings": {
                 "network": "tcp", "security": "tls",
@@ -161,7 +172,7 @@ def load_config():
     inbound = direct_inbound(config)
     if inbound is None:
         raise ManagerError(
-            f"{path} does not contain a native Trojan+TLS inbound on port 443. "
+            f"{path} does not contain a native Trojan+TLS inbound on port 8443. "
             "Refusing to overwrite a different server configuration."
         )
     return path, config
@@ -170,7 +181,7 @@ def load_config():
 def direct_inbound(config):
     for inbound in config.get("inbounds", []):
         stream = inbound.get("streamSettings", {})
-        if (inbound.get("protocol") == "trojan" and int(inbound.get("port", 0)) == 443
+        if (inbound.get("protocol") == "trojan" and int(inbound.get("port", 0)) == configured_port()
                 and stream.get("security") == "tls"
                 and stream.get("network", "tcp") == "tcp"):
             return inbound
@@ -250,7 +261,7 @@ def add_account():
     print("\nTrojan account created and Xray restarted successfully.")
     print(f"Username: {username}")
     print(f"Password: {password}")
-    print(f"Server port: 443/TCP with TLS")
+    print(f"Server port: {configured_port()}/TCP with TLS")
     print("Save the password now; it is not stored in the menu's account list.")
 
 
@@ -303,7 +314,7 @@ def show_status():
         try:
             data = json.loads(path.read_text())
             inbound = direct_inbound(data)
-            print(f"Direct Trojan TLS/443: {'configured' if inbound else 'NOT CONFIGURED'}")
+            print(f"Direct Trojan TLS/8443: {'configured' if inbound else 'NOT CONFIGURED'}")
             print(f"Outbound internet (freedom): {'configured' if any(o.get('protocol') == 'freedom' for o in data.get('outbounds', [])) else 'NOT CONFIGURED'}")
             print(f"Trojan accounts: {len(inbound.get('settings', {}).get('clients', [])) if inbound else 0}")
         except (OSError, json.JSONDecodeError) as exc:
