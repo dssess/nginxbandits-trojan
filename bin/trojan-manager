@@ -64,7 +64,7 @@ def read_domain():
 def configured_port():
     config = BASE / "core" / "nginxbandits.conf"
     if config.is_file():
-        match = re.search(r'^\\s*TROJAN_PORT\\s*=\\s*["\\']?(\\d+)', config.read_text(errors="replace"), re.M)
+        match = re.search(r'^\s*TROJAN_PORT\s*=\s*["\']?(\d+)', config.read_text(errors="replace"), re.M)
         if match:
             port = int(match.group(1))
             if 1024 <= port <= 65535:
