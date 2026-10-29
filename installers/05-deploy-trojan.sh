@@ -58,6 +58,14 @@ fi
 
 WS_WAS_ACTIVE=no
 systemctl is-active --quiet nginxbandits-ws && WS_WAS_ACTIVE=yes || true
+# Ensure the existing WebSocket service is restored if certificate issuance is interrupted.
+restore_ws_early() {
+    if [[ "$WS_WAS_ACTIVE" == yes ]] && ! systemctl is-active --quiet nginxbandits-ws; then
+        systemctl start nginxbandits-ws >/dev/null 2>&1 || true
+    fi
+}
+trap restore_ws_early EXIT
+
 STUNNEL_WAS_ACTIVE=no
 systemctl is-active --quiet stunnel4 && STUNNEL_WAS_ACTIVE=yes || true
 XRAY_WAS_ACTIVE=no
@@ -172,13 +180,16 @@ MIGRATION_STARTED=1
 log "Installing Xray if it is not already present."
 if ! command -v xray >/dev/null 2>&1; then
     INSTALLER="$(mktemp)"
-    trap 'rm -f "${INSTALLER:-}"' EXIT
-    curl --fail --silent --show-error --location \
-        https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o "$INSTALLER" ||
+    if ! curl --fail --silent --show-error --location \
+        https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o "$INSTALLER"; then
+        rm -f "$INSTALLER"
         die "Could not download the Xray installer."
-    bash "$INSTALLER" install || die "Xray installation failed."
+    fi
+    if ! bash "$INSTALLER" install; then
+        rm -f "$INSTALLER"
+        die "Xray installation failed."
+    fi
     rm -f "$INSTALLER"
-    trap rollback_on_failure EXIT
 fi
 XRAY_BIN="$(command -v xray)" || die "Xray executable was not found."
 "$XRAY_BIN" version >/dev/null 2>&1 || die "Xray cannot execute."
@@ -326,8 +337,8 @@ HOOKPOST
 cat > "$HOOK_DIR/deploy/20-nginxbandits-trojan-copy-cert" <<HOOKDEPLOY
 #!/usr/bin/env bash
 set -Eeuo pipefail
-DOMAIN="$DOMAIN"
 LE_DIR="/etc/letsencrypt/live/$DOMAIN"
+if [[ "${RENEWED_LINEAGE:-}" != "$LE_DIR" ]]; then exit 0; fi
 TLS_DIR="/etc/nginxbandits/tls"
 install -d -o root -g xray -m 0750 "$TLS_DIR"
 install -o root -g xray -m 0644 "$LE_DIR/fullchain.pem" "$TLS_DIR/fullchain.pem"
