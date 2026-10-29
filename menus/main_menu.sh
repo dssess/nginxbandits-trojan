@@ -152,15 +152,21 @@ execute_add_user() {
         read -p "Bandwidth Limit in GB (0 = Unlimited) [Default: 0]: " BW_LIMIT
         BW_LIMIT=${BW_LIMIT:-0}
 
-        /opt/janabitech/bin/janabitech user add "$USERNAME" "$PASSWORD" "$DAYS" "$MAX_LOGINS" "$BW_LIMIT" > /dev/null 2>&1
+        /opt/janabitech/bin/janabitech user add "$USERNAME" "$PASSWORD" "$DAYS" "$MAX_LOGINS" "$BW_LIMIT"
         API_STATUS=$?
-        
-        if [ $API_STATUS -eq 2 ]; then
-            echo -e "\n${ORANGE}[!] User '${USERNAME}' already exists.${NC}"
+
+        if [ "$API_STATUS" -eq 2 ]; then
+            echo -e "\\n${ORANGE}[!] User '${USERNAME}' already exists.${NC}"
             read -p "Do you want to create another user? (y/n): " RETRY
             if [[ "$RETRY" =~ ^[Yy] ]]; then continue; else return; fi
-        elif [ $API_STATUS -ne 0 ]; then
-            echo -e "\n${RED}[-] Failed to create account. Ensure username is 3-32 chars.${NC}"; pause; return
+        elif [ "$API_STATUS" -eq 3 ]; then
+            echo -e "\\n${RED}[-] Invalid username. Use 3-32 characters: letters, numbers, underscore or hyphen.${NC}"
+            pause
+            return
+        elif [ "$API_STATUS" -ne 0 ]; then
+            echo -e "\\n${RED}[-] Account creation failed (exit code $API_STATUS). The error above identifies the cause.${NC}"
+            pause
+            return
         fi
         break
     done
@@ -973,10 +979,10 @@ menu_trojan_server() {
         echo
         echo -e "${CYAN}========== TROJAN SERVER MANAGER ==========${NC}"
         echo
-        echo "  [1] Add Trojan server"
-        echo "  [2] List configured servers"
-        echo "  [3] Check backend status"
-        echo "  [4] Remove a server"
+        echo "  [1] Create Trojan account"
+        echo "  [2] List Trojan accounts"
+        echo "  [3] Check direct TLS/443 status"
+        echo "  [4] Remove Trojan account"
         echo "  [0] Return to main menu"
         echo
         read -rp "Select an option: " trojan_opt
