@@ -137,7 +137,7 @@ for service in ssh dropbear nginxbandits-ws nginxbandits-trojan; do
     fi
 done
 
-for port in 22 80 443 109 143 447 777; do
+for port in 22 80 443 109 143 447 777 8443; do
     if ss -H -lnt "sport = :$port" 2>/dev/null | grep -q .; then
         printf '[OK] TCP/%s is listening\n' "$port"
     else
