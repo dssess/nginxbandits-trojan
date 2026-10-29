@@ -33,6 +33,11 @@ done
 source "$CONFIG_FILE"
 DOMAIN="${TROJAN_DOMAIN:-${PRIMARY_DOMAIN:-}}"
 PORT="${TROJAN_PORT:-8443}"
+# Migrate legacy direct-443/low-port settings away from Nginx and SSH-facing ports.
+if [[ "$PORT" == "443" || ! "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1024 || PORT > 65535 )); then
+    log "Legacy/privileged Trojan port setting detected; using dedicated TCP/8443 to protect existing listeners."
+    PORT=8443
+fi
 [[ "${TROJAN_ENABLED:-no}" == "yes" ]] || die 'Set TROJAN_ENABLED="yes" in nginxbandits.conf.'
 [[ "$DOMAIN" =~ ^[A-Za-z0-9.-]+$ ]] || die "Set a valid TROJAN_DOMAIN or PRIMARY_DOMAIN first."
 [[ "$DOMAIN" != .* && "$DOMAIN" != *..* && "$DOMAIN" != *- && "$DOMAIN" != -* ]] || die "Malformed domain."
