@@ -34,7 +34,7 @@ source "$CONFIG_FILE"
 DOMAIN="${TROJAN_DOMAIN:-${PRIMARY_DOMAIN:-}}"
 PORT="${TROJAN_PORT:-8443}"
 # Migrate legacy direct-443/low-port settings away from Nginx and SSH-facing ports.
-if [[ "$PORT" == "443" || ! "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1024 || PORT > 65535 )); then
+if [[ "$PORT" == "443" || "$PORT" == "10003" || ! "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1024 || PORT > 65535 )); then
     log "Legacy/privileged Trojan port setting detected; using dedicated TCP/8443 to protect existing listeners."
     PORT=8443
 fi
