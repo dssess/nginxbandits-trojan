@@ -81,6 +81,16 @@ if [[ -n "$PORT443" ]] && ! grep -Eq 'stunnel4|stunnel|haproxy' <<<"$PORT443"; t
     printf '%s\n' "$PORT443"
     die "Port 443 is owned by an unexpected process. No listener has been stopped."
 fi
+if [[ "$PORT80" == *python3* ]] && ! systemctl is-active --quiet nginxbandits-ws; then
+    die "Port 80 is held by Python, but nginxbandits-ws is not active; refusing to migrate an unidentified process."
+fi
+if [[ "$PORT443" == *stunnel* ]] && ! systemctl is-active --quiet stunnel4; then
+    die "Port 443 is held by Stunnel, but stunnel4 is not active; refusing to migrate an unidentified process."
+fi
+
+# Capture pre-install service state before apt can auto-start HAProxy.
+HAPROXY_WAS_ACTIVE=no
+systemctl is-active --quiet haproxy && HAPROXY_WAS_ACTIVE=yes || true
 
 log "Installing the shared router dependency."
 export DEBIAN_FRONTEND=noninteractive
@@ -131,8 +141,6 @@ backup_file "$XRAY_CONF" xray.json
 backup_file "$XRAY_UNIT" trojan.service
 backup_file "$HAPROXY_PEM" shared.pem
 
-HAPROXY_WAS_ACTIVE=no
-systemctl is-active --quiet haproxy && HAPROXY_WAS_ACTIVE=yes || true
 MIGRATION_STARTED=0
 
 restore_file() {
