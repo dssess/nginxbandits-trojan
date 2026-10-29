@@ -69,10 +69,10 @@ DROPBEAR_RECEIVE_WINDOW=65536
 DROPBEAR
 
 # ------------------------------------------------------
-# WEBSOCKET PROXY
+# WEBSOCKET SSH BACKEND
 # ------------------------------------------------------
 
-echo "[*] Configuring Async WebSocket proxy..."
+echo "[*] Configuring Async WebSocket SSH proxy..."
 
 WS_PROXY="${BASE_DIR}/services/routing/async-ws-proxy.py"
 
@@ -102,10 +102,12 @@ WantedBy=multi-user.target
 SERVICE
 
 # ------------------------------------------------------
-# STUNNEL
+# STUNNEL — ALTERNATE TLS PORTS ONLY
 # ------------------------------------------------------
+# Public 443 is reserved for the shared HAProxy entry point.
+# Stunnel remains available on the legacy alternate TLS ports.
 
-echo "[*] Configuring Stunnel TLS bridging..."
+echo "[*] Configuring Stunnel on alternate TLS ports only..."
 
 ensure_tls_cert "$PRIMARY_DOMAIN"
 
@@ -118,10 +120,6 @@ socket = a:SO_REUSEADDR=1
 socket = a:SO_KEEPALIVE=1
 socket = l:TCP_NODELAY=1
 socket = r:TCP_NODELAY=1
-
-[ssh-ws-ssl]
-accept = ${PORT_WS_HTTPS}
-connect = 127.0.0.1:${PORT_WS_HTTP}
 
 [dropbear-ssl-447]
 accept = ${PORT_SSL_ALT1}
@@ -155,29 +153,25 @@ systemctl enable nginxbandits-ws >/dev/null 2>&1
 systemctl enable stunnel4 >/dev/null 2>&1 || true
 
 echo "[*] Restarting OpenSSH..."
-
-systemctl restart ssh >/dev/null 2>&1 || \
-systemctl restart sshd >/dev/null 2>&1 || true
-
+systemctl restart ssh >/dev/null 2>&1 ||
+    systemctl restart sshd >/dev/null 2>&1 || true
 systemctl restart ssh.socket >/dev/null 2>&1 || true
 
 echo "[*] Restarting Dropbear..."
-
 systemctl restart dropbear >/dev/null 2>&1 || true
 
 echo "[*] Starting WebSocket proxy..."
-
 systemctl restart nginxbandits-ws >/dev/null 2>&1 || true
 
-echo "[*] Starting Stunnel..."
-
+echo "[*] Starting Stunnel alternate TLS listeners..."
 systemctl restart stunnel4 >/dev/null 2>&1 || true
 
 echo
 echo "[+] Routing deployment complete."
 echo
-echo "SSH       : ${PORT_SSH}"
-echo "Dropbear  : ${PORT_DROPBEAR}, ${PORT_DROPBEAR_ALT}"
-echo "WebSocket : ${PORT_WS_HTTP}, ${PORT_WS_HTTPS}"
-echo "SSL Alt   : ${PORT_SSL_ALT1}, ${PORT_SSL_ALT2}"
+echo "SSH                 : ${PORT_SSH}"
+echo "Dropbear            : ${PORT_DROPBEAR}, ${PORT_DROPBEAR_ALT}"
+echo "WebSocket backend   : ${PORT_WS_HTTP} (migrated behind shared router in phase 05)"
+echo "Shared HTTP/HTTPS   : ${PORT_WS_HTTP}, ${PORT_WS_HTTPS} (HAProxy in phase 05)"
+echo "Stunnel alternate   : ${PORT_SSL_ALT1}, ${PORT_SSL_ALT2}"
 echo
