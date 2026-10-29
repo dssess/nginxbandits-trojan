@@ -61,6 +61,17 @@ chmod +x "$BASE_DIR/install.sh"
 find "$BASE_DIR/bin" "$BASE_DIR/menus" "$BASE_DIR/installers" "$BASE_DIR/lib" \
     -type f -name "*.sh" -exec chmod +x {} \;
 
+# These entry points are invoked directly by the menu and must be executable.
+for entry in \
+    "$BASE_DIR/bin/nginxbandits" \
+    "$BASE_DIR/bin/janabitech" \
+    "$BASE_DIR/bin/trojan-manager" \
+    "$BASE_DIR/menus/main_menu.sh"; do
+    if [ -f "$entry" ]; then
+        chmod 0755 "$entry"
+    fi
+done
+
 echo -e "${CYAN}[*] Running NginxBandits installation phases...${NC}"
 
 PHASES=(
@@ -114,4 +125,30 @@ echo "CLI          : nginxbandits"
 echo "Legacy CLI   : janabitech"
 echo "Menu         : menu"
 echo
-echo -e "${GREEN}NginxBandits is ready.${NC}"
+echo -e "${CYAN}[*] Running final service checks... ${NC}"
+
+FAILED=0
+for service in ssh dropbear nginxbandits-ws nginxbandits-trojan; do
+    if systemctl is-active --quiet "$service"; then
+        printf '[OK] %-24s ACTIVE\n' "$service"
+    else
+        printf '[FAIL] %-22s not active\n' "$service"
+        FAILED=1
+    fi
+done
+
+for port in 22 80 443 109 143 447 777; do
+    if ss -H -lnt "sport = :$port" 2>/dev/null | grep -q .; then
+        printf '[OK] TCP/%s is listening\n' "$port"
+    else
+        printf '[WARN] TCP/%s is not listening\n' "$port"
+    fi
+done
+
+echo
+if [ "$FAILED" -ne 0 ]; then
+    echo -e "${RED}[WARN] One or more core services are not active. Review the error shown during installation before using the server.${NC}"
+    exit 1
+fi
+
+echo -e "${GREEN}NginxBandits is ready. Open the menu with: menu${NC}"
