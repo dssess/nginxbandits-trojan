@@ -139,6 +139,7 @@ backup_file() {
         printf 'no\n' > "$BACKUP_DIR/$name.existed"
     fi
 }
+backup_file "$CONFIG_FILE" nginxbandits.conf
 backup_file "$STUNNEL_CONF" stunnel.conf
 backup_file "$XRAY_CONF" xray.json
 backup_file "$XRAY_UNIT" trojan.service
@@ -160,6 +161,7 @@ rollback_on_failure() {
         log "Deployment failed; restoring saved service configuration."
         set +e
         systemctl stop nginxbandits-trojan >/dev/null 2>&1
+        restore_file "$CONFIG_FILE" nginxbandits.conf
         restore_file "$STUNNEL_CONF" stunnel.conf
         restore_file "$XRAY_CONF" xray.json
         restore_file "$XRAY_UNIT" trojan.service
@@ -176,6 +178,17 @@ rollback_on_failure() {
 }
 trap rollback_on_failure EXIT
 MIGRATION_STARTED=1
+# Keep the on-disk settings aligned with the direct public Trojan listener.
+if grep -qE '^TROJAN_PORT=' "$CONFIG_FILE"; then
+    sed -i 's/^TROJAN_PORT=.*/TROJAN_PORT=443/' "$CONFIG_FILE"
+else
+    printf '\nTROJAN_PORT=443\n' >> "$CONFIG_FILE"
+fi
+if grep -qE '^TROJAN_TRANSPORT=' "$CONFIG_FILE"; then
+    sed -i 's/^TROJAN_TRANSPORT=.*/TROJAN_TRANSPORT="tcp"/' "$CONFIG_FILE"
+else
+    printf 'TROJAN_TRANSPORT="tcp"\n' >> "$CONFIG_FILE"
+fi
 
 log "Installing Xray if it is not already present."
 if ! command -v xray >/dev/null 2>&1; then
